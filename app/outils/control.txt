@@ -1,0 +1,821 @@
+#define SEED_OF_N 8
+// Submission entry point: reads the case, decodes each codeword with the shared decoder core, prints the codewords.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <chrono>
+#include <string>
+#include <algorithm>
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
+// Shared decoder core (included by src/main.cpp for submissions and by src/bench.cpp for local research).
+//
+// Deep-unfolded LQA / Simulated-Bifurcation variant acting on cavity fields of a higher-order Ising model.
+//
+// Ising model. For H = [P | I] the parity spins are eliminated (sigma_p = product of the information spins of its row).
+// The two bits (a, b) of one 16-QAM axis come from a single received value y, so the exact channel energy of a symbol is a
+// two-spin Ising term:   -( h_a s_a + h_b s_b + d s_a s_b ),  h_a = 2Ay/s2, h_b = -2A^2/s2, d = Ay/s2  (A = 1/sqrt(10), s2 = noise var).
+//     E(sigma) = - sum_symbols ( h_a s_a + h_b s_b + d s_a s_b ),   parity spins replaced by products of information spins.
+// Relaxed cost C(x): each factor exp(-E_f) is replaced by its multilinear extension, so C = E on sigma in {-1,+1}^K.
+// Force of interaction m on spin i (discrete difference of C along spin i):
+//     phi_{m->i} = atanh( tanh(kap J_m) prod_{n != i} x_n ),       J_m = effective half-field of parity spin m.
+// Cavity construction: spin i carries one auxiliary field per interaction m, driven by the cost with m removed,
+//     F_{i->m} = rho r_i + alpha sum_{m' != m} phi_{m'->i},   x_{i->m} = tanh(F_{i->m})      (LQA spin parametrisation)
+// One step = one asynchronous sweep in which every auxiliary spin is updated once (interactions visited in random order).
+// The symbol coupling d is handled exactly: the effective field of a bit uses the current magnetisation of its partner.
+// Up to 6 trajectories per codeword; perturbed trajectories may restart inside their 50 steps; the read-out keeps the
+// state of lowest exact energy E.
+#ifdef PROF
+#include <chrono>
+static double profAcc[8]; static std::chrono::steady_clock::time_point profLast;
+#define PROF_T(k) { auto n_ = std::chrono::steady_clock::now(); if (k) profAcc[k] += std::chrono::duration<double>(n_ - profLast).count(); profLast = n_; }
+#else
+#define PROF_T(k)
+#endif
+#include <cmath>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+
+struct Params {
+    int steps = 50;            // N_steps per trajectory (<= 50)
+    int ntraj = 1;             // trajectories per codeword (<= 6); trajectory 0 is unperturbed and uses all steps
+    int natt = 1;              // restarts inside each perturbed trajectory (natt * attempt length <= steps)
+    float sig = 0.3f;          // multiplicative perturbation of the channel fields in perturbed attempts
+    float margin = 0.f;        // a perturbed attempt replaces the incumbent only if its energy is lower by this margin
+    int fb = 0;                // feedback restart inside a trajectory: 1 = erase channel fields contradicted by the collective field, 2 = soft re-weighting
+    float fbthr = 1.f, fbg = 0.5f, gsc = 0.f;
+    float clipA = 0, clipB = 0, powA = 1, powB = 1;   // per-trajectory transform of the channel fields: clip level / power, interpolated over trajectories 1..5
+    int kickT = 0, kickEvery = 0; float kickG = 0;   // soft-mode extrapolation: at step kickT (then every kickEvery) phi += kickG * (phi - phi_previous_step)
+    int maxtraj = 6;           // hard cap on trajectories (rule: <= 6); only the research bench may raise it to study scaling
+    int abT = 0; float abThr = 0;   // early abort of a perturbed attempt: after abT steps, give up if the mean |field| is below abThr
+    int pins = 0; float pinF = 8.f; int pinLen = 25; int pinOracle = 0;   // research: guess the 'pins' least polarised spins (2^pins patterns)
+    int guess = 0, gTA = 15, gLen = 17, gMaxPat = 0;   // guess>0: after gTA free steps every trajectory continues with a hypothesis on the 'guess' least polarised spins
+    int ravg = 0;              // research: read-out from the fields averaged over the last ravg steps of the unperturbed trajectory
+    int cont = 0;              // after a perturbed attempt, continue for cont steps with the unperturbed fields (no reset)
+    int avg = 0;               // 1: read-out from the fields averaged over the trajectories (no energy selection)
+    int accpol = 1;            // accept a perturbed attempt only if it ends polarised (mean |field| >= stuck), i.e. it left the stuck state
+    float stuck = 1e9f;        // perturbed trajectories are evaluated only when trajectory 0 ends weakly polarised (mean |field| < stuck)
+    int joint = 1;             // exact two-spin symbol energy
+    float alpha[51], rho[51], kap[51];   // deep-unfolding coefficients, index = step (50 = read-out)
+    Params() { for (int t = 0; t <= 50; t++) { alpha[t] = 1.f; rho[t] = 1.f; kap[t] = 1.f; } }
+};
+
+// ---- Fast engine for the extended search: 8 perturbed trajectories of one codeword advance together (one per SIMD lane).
+// Same cavity dynamics written with odds instead of fields, so that a sweep needs no transcendental function:
+//   T_i = exp(2 sum_m phi_{m->i}),  Q_e = exp(2 phi_e),  R_i = exp(2 r_i)   =>   x_{i->m} = tanh(F_{i->m}) = (R_i T_i - Q_e) / (R_i T_i + Q_e)
+//   new Q_e = (1 + u) / (1 - u),  u = tanh(J_m) prod_{n != i} x_n.
+// The symbol energy gives R_i and tanh(J_m) as rational functions of the odds of the partner and of G = exp(2 A y / s2), k = exp(-4 A^2 / s2).
+typedef float v8 __attribute__((vector_size(32), aligned(4)));     // unaligned 8-float vector: no alignment requirement on containers
+struct V8box { v8 v; };                             // container element (a bare vector type as template argument draws a compiler warning)
+static inline v8 *vp(std::vector<V8box> &x) { return reinterpret_cast<v8 *>(x.data()); }
+struct Fast8Ctx { int M, K, N, len, M2, S2; const int *rs, *cols; int *order; uint64_t *rng; v8 *T, *Q, *IQ, *R, *tm, *pall; const v8 *G, *Pm; float k, U; int gmode; };
+// Search record of one codeword: incumbent energy, how many polarised trajectories ended exactly on the incumbent, totals.
+struct Search { std::vector<double> cy; std::vector<float> cha, chd; bool cached = false;      // symbol values of the codeword, computed once
+    float bestE = 0; int hits = 0; long npol = 0, natt = 0, foundAt = 0; double zc = 0; std::vector<int> pool; std::vector<float> d0; std::vector<int> vote, voteLow; long nLow = 0; std::vector<int> svH; std::vector<float> svS; long nsv = 0; std::vector<float> ubest; };
+#define V8(f) (v8{(f), (f), (f), (f), (f), (f), (f), (f)})
+#define VCL(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+__attribute__((target_clones("avx2", "default")))
+void fast8_run(const Fast8Ctx &c) {
+    const int M = c.M, K = c.K, N = c.N, gm = c.gmode, M2 = c.M2, S2 = c.S2;
+    const v8 one = V8(1.f), kk = V8(c.k), Tlo = V8(6.9e-13f), Thi = V8(1.45e12f), Rlo = V8(2.06e-9f), Rhi = V8(4.85e8f), Uv = V8(c.U), nUv = V8(-c.U);
+    for (int e = 0; e < c.rs[M2]; e++) { c.Q[e] = one; c.IQ[e] = one; }
+    for (int i = 0; i < S2; i++) c.T[i] = one;
+    for (int i = K; i < S2; i++) c.R[i] = one;                  // pair variables carry no field of their own
+    for (int m = 0; m < M2; m++) c.pall[m] = V8(0.f);
+    for (int m = M; m < M2; m++) c.tm[m] = one;                 // hard constraints tau = sigma_a sigma_b
+    uint64_t rng = *c.rng;
+    for (int t = 0; t <= c.len; t++) {
+        for (int s = 0; s < K / 2; s++) {           // channel odds of the information spins from the symbol energy and the extrinsic odds of the partner
+            int a = 2 * s, b = a + 1; v8 G = c.G[s], Ta = VCL(c.T[a], Tlo, Thi), Tb = VCL(c.T[b], Tlo, Thi);
+            v8 Ra = G * G * (kk * G * Tb + one) / (kk * Tb + G), Rb = kk * (G * G * G * Ta + one) / (G * G * Ta + G);
+            Ra = Ra * c.Pm[a]; Rb = Rb * c.Pm[b]; c.R[a] = VCL(Ra, Rlo, Rhi); c.R[b] = VCL(Rb, Rlo, Rhi);
+        }
+        if (t == c.len) break;                      // read-out fields are R * T
+        for (int s = K / 2; s < N / 2; s++) {       // tanh of the parity fields, partner magnetisation = product of the cavity spins of its row
+            int m1 = 2 * s - K, m2 = m1 + 1; v8 G = c.G[s], p1 = c.pall[m1], p2 = c.pall[m2];
+            v8 n1 = G * G * (kk * G * (one + p2) + (one - p2)), d1 = kk * (one + p2) + G * (one - p2);
+            v8 n2 = kk * (G * G * G * (one + p1) + (one - p1)), d2 = G * G * (one + p1) + G * (one - p1);
+            c.tm[m1] = (n1 - d1) / (n1 + d1); c.tm[m2] = (n2 - d2) / (n2 + d2);
+        }
+        for (int j = M2 - 1; j > 0; j--) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; int r = (int)(rng % (unsigned)(j + 1)); int tmp = c.order[j]; c.order[j] = c.order[r]; c.order[r] = tmp; }
+        for (int q = 0; q < M2; q++) {
+            int m = c.order[q], a = c.rs[m], d = c.rs[m + 1] - a; v8 pre[32], x[32], acc = one;
+            for (int j = 0; j < d; j++) {
+                int i = c.cols[a + j]; v8 w = c.IQ[a + j];
+                // research: strength of the reaction (cavity) term. 0 = exact cavity field; 1 = half (square root), 2 = double, 3 = none (plain mean field), 4 = 1.5
+                if (gm) { if (gm == 2) w = w * w; else if (gm == 3) w = one; else { v8 r = w; for (int l = 0; l < 8; l++) r[l] = __builtin_sqrtf(w[l]); w = gm == 1 ? r : w * r; } }
+                v8 o = c.R[i] * c.T[i] * w; x[j] = (o - one) / (o + one); pre[j] = acc; acc = acc * x[j];
+            }
+            c.pall[m] = acc; acc = c.tm[m];
+            for (int j = d - 1; j >= 0; j--) {
+                int i = c.cols[a + j]; v8 u = pre[j] * acc; acc = acc * x[j]; u = VCL(u, nUv, Uv);
+                v8 r = one / (one - u * u), qn = (one + u) * (one + u) * r;
+                c.T[i] = c.T[i] * c.IQ[a + j] * qn; c.Q[a + j] = qn; c.IQ[a + j] = (one - u) * (one - u) * r;
+            }
+        }
+    }
+    *c.rng = rng;
+}
+
+struct Decoder {
+    int N = 0, K = 0, M = 0, S = 0, E = 0; bool sys = false; double snr = 0;
+    std::vector<int> rs, cols, order;
+    // per frame
+    std::vector<float> sPhi, sTot, sPall, DA;
+    std::vector<float> phiPrev, pinv; bool kickOn = false, pinOn = false; const char *truth = nullptr; long statPinRuns = 0;
+    std::vector<float> r0, J0, ha, hd, pe, reff, Jeff, tm, fr, fJ, phi, tot, pall, D, bestD;
+    std::vector<char> cand;
+    float hb = 0; bool jointOK = false; float curClip = 0, curPow = 1;
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    long statSwitch = 0, statJointOff = 0, statStuck = 0;
+    bool lastStuck = false; float lastE = 0;      // outcome of the last decode(): still weakly polarised? exact energy of the returned codeword
+    std::vector<double> ysym; double qa = 0, qc = 0; bool fastOK = false; int maxDeg = 0, maxRow = 0;
+    std::vector<int> rs2, cols2, order2; int S2 = 0, M2 = 0, nAux = 0;      // alternative representation with pair variables
+    std::vector<V8box> fT, fQ, fIQ, fR, fTm, fPall, fG, fPm; long statFast = 0; std::vector<float> D0;
+    float voteGap = 20.f; std::vector<int> antiPool; bool collectStuck = false; std::vector<float> ucur; long statLocImp = 0, statNormImp = 0;
+    double zc = 0;                                // per frame: sum (y - x)^2 / s2 = 2 E + zc for the codeword of energy E
+    // Normalised squared distance between the received values and a codeword of energy e: for the transmitted codeword it is ~ N(0,1).
+    float zOf(float e) const { return jointOK ? (float)((2.0 * e + zc - 0.5 * N) / sqrt((double)N)) : 0.f; }
+
+    inline uint64_t rnd() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
+    inline float gauss() {     // Irwin-Hall(4) approximation of a standard normal
+        uint64_t u = rnd(); float s = (float)(u & 0xFFFF) + (float)((u >> 16) & 0xFFFF) + (float)((u >> 32) & 0xFFFF) + (float)((u >> 48) & 0xFFFF);
+        return (s * (1.f / 65536.f) - 2.f) * 1.7320508f;
+    }
+    static inline float fatanh(float u) {
+        if (u > 0.999999f) u = 0.999999f; else if (u < -0.999999f) u = -0.999999f;
+        return 0.5f * logf((1.f + u) / (1.f - u));
+    }
+    // half-field of one spin of a symbol given the magnetisation mu of its partner (own field h, partner field g, coupling d):
+    //   h + 1/2 ln[ (e^{g+d}(1+mu) + e^{-g-d}(1-mu)) / (e^{g-d}(1+mu) + e^{-g+d}(1-mu)) ],  the four exponentials are precomputed in q[0..3]
+    static inline float pairField(float h, const float *q, float mu) { float a = 1.f + mu, b = 1.f - mu; return h + 0.5f * logf((q[0] * a + q[1] * b) / (q[2] * a + q[3] * b)); }
+
+    void setCode(int N_, int K_, double snr_, const std::vector<std::vector<int>> &rows) {
+        N = N_; K = K_; M = N - K; snr = snr_;
+        sys = true;
+        for (int m = 0; m < M && sys; m++) { int cnt = 0; bool diag = false; for (int j : rows[m]) if (j >= K) { cnt++; if (j == K + m) diag = true; } if (cnt != 1 || !diag) sys = false; }
+        S = sys ? K : N; rs.assign(M + 1, 0); cols.clear();
+        for (int m = 0; m < M; m++) { for (int j : rows[m]) if (!sys || j < K) cols.push_back(j); rs[m + 1] = (int)cols.size(); }
+        E = (int)cols.size(); ysym.resize(N / 2 + 1);
+        { std::vector<int> deg(S, 0); maxRow = 0; for (int m = 0; m < M; m++) maxRow = std::max(maxRow, rs[m + 1] - rs[m]); for (int e = 0; e < E; e++) deg[cols[e]]++; maxDeg = 0; for (int i = 0; i < S; i++) maxDeg = std::max(maxDeg, deg[i]); }
+        fastOK = sys && N % 2 == 0 && K % 2 == 0 && maxRow <= 32 && maxDeg <= 15;
+        if (fastOK) { buildAlt(); fT.resize(S2); fR.resize(S2); fQ.resize(std::max(cols.size(), cols2.size())); fIQ.resize(std::max(cols.size(), cols2.size())); fTm.resize(M2); fPall.resize(M2); fG.resize(N / 2); fPm.assign(S2, V8box{V8(1.f)}); }
+        order.resize(M); for (int m = 0; m < M; m++) order[m] = m;
+        r0.resize(S); J0.resize(M); ha.resize(N / 2 + 1); hd.resize(N / 2 + 1); pe.resize(8 * (N / 2 + 1)); reff.resize(S); Jeff.resize(M); tm.resize(M); fr.resize(S); fJ.resize(M);
+        phi.resize(E); phiPrev.resize(E); pinv.assign(S, 0.f); tot.resize(S); pall.resize(M); D.resize(S); bestD.resize(S); cand.resize(N);
+    }
+
+    // Alternative exact representation: for every pair of spins (a, b) that appears together in at least two interactions, a new spin
+    // tau = sigma_a sigma_b replaces the product in those interactions and a hard three-spin constraint tau sigma_a sigma_b = +1 is added.
+    // The energy of every configuration is unchanged; the short loops through the pair disappear from the interaction graph.
+    void buildAlt() {
+        std::vector<std::vector<int>> mem(M); for (int m = 0; m < M; m++) mem[m].assign(cols.begin() + rs[m], cols.begin() + rs[m + 1]);
+        std::vector<std::pair<long long, int>> pr;                 // (pair key, row)
+        for (int m = 0; m < M; m++) for (size_t j = 0; j < mem[m].size(); j++) for (size_t k = j + 1; k < mem[m].size(); k++) {
+            int a = std::min(mem[m][j], mem[m][k]), b = std::max(mem[m][j], mem[m][k]); pr.push_back({(long long)a * S + b, m}); }
+        std::sort(pr.begin(), pr.end());
+        std::vector<std::vector<int>> aux; nAux = 0;
+        for (size_t i = 0; i < pr.size();) {
+            size_t j = i; while (j < pr.size() && pr[j].first == pr[i].first) j++;
+            if (j - i >= 2) {
+                int a = (int)(pr[i].first / S), b = (int)(pr[i].first % S); std::vector<int> ok;
+                for (size_t q = i; q < j; q++) { auto &v = mem[pr[q].second]; if (std::find(v.begin(), v.end(), a) != v.end() && std::find(v.begin(), v.end(), b) != v.end()) ok.push_back(pr[q].second); }
+                if (ok.size() >= 2) {
+                    int t = S + nAux++;
+                    for (int m : ok) { auto &v = mem[m]; v.erase(std::find(v.begin(), v.end(), a)); v.erase(std::find(v.begin(), v.end(), b)); v.push_back(t); }
+                    aux.push_back({t, a, b});
+                }
+            }
+            i = j;
+        }
+        S2 = S + nAux; M2 = M + nAux; rs2.assign(M2 + 1, 0); cols2.clear();
+        for (int m = 0; m < M; m++) { for (int v : mem[m]) cols2.push_back(v); rs2[m + 1] = (int)cols2.size(); }
+        for (int q = 0; q < nAux; q++) { for (int v : aux[q]) cols2.push_back(v); rs2[M + q + 1] = (int)cols2.size(); }
+        order2.resize(M2); for (int m = 0; m < M2; m++) order2[m] = m;
+    }
+
+    // Recover the received value of every symbol from the MSB LLR (exact inverse of the demapper) and build the symbol energies.
+    void prepFrame(const float *L, const Params &P) {
+        for (int i = 0; i < S; i++) r0[i] = 0.5f * L[i];
+        for (int m = 0; m < M; m++) J0[m] = sys ? 0.5f * L[K + m] : 20.f;
+        jointOK = false;
+        if (!(P.joint && sys && N % 2 == 0 && K % 2 == 0 && snr > -50 && snr < 100)) return;
+        const double A = 1.0 / sqrt(10.0), s2 = 0.5 * pow(10.0, -snr / 10.0), a = A / s2, c = 2 * A * A / s2;
+        hb = (float)(-c); int bad = 0; zc = 0.5 * N * 5 * A * A / s2; qa = a; qc = c;
+        for (int s = 0; s < N / 2; s++) {
+            double La = L[2 * s], y = La / (4 * a);
+            for (int it = 0; it < 40; it++) {
+                double u = a * y - c, w = a * y + c;
+                double g = 4 * a * y + (fabs(u) + log1p(exp(-2 * fabs(u)))) - (fabs(w) + log1p(exp(-2 * fabs(w)))) - La;
+                double gp = 4 * a + a * (tanh(u) - tanh(w)); double dy = g / gp; y -= dy; if (fabs(dy) < 1e-12) break;
+            }
+            ha[s] = (float)(2 * a * y); hd[s] = (float)(a * y); zc += y * y / s2; ysym[s] = y;
+            double ay = std::max(-25.0, std::min(25.0, a * y)), cc = std::min(c, 50.0); float *q = &pe[8 * s];
+            q[0] = (float)exp(-cc + ay); q[1] = (float)exp(cc - ay); q[2] = (float)exp(-cc - ay); q[3] = (float)exp(cc + ay);          // bit a: g = hb, d = hd
+            q[4] = (float)exp(3 * ay); q[5] = (float)exp(-3 * ay); q[6] = (float)exp(ay); q[7] = (float)exp(-ay);                    // bit b: g = ha, d = hd
+            double lb = 2 * (-c) + (fabs(3 * a * y) + log1p(exp(-2 * fabs(3 * a * y)))) - (fabs(a * y) + log1p(exp(-2 * fabs(a * y))));
+            if (fabs(lb - L[2 * s + 1]) > 1e-2 * (1 + fabs(lb))) bad++;
+        }
+        jointOK = bad * 200 < N / 2;           // fall back to the marginal LLRs if the data do not follow the 16-QAM model
+        if (!jointOK) statJointOff++;
+    }
+
+    inline float xf(float v) const {
+        float a = fabsf(v); if (curPow != 1.f) a = powf(a, curPow); if (curClip > 0 && a > curClip) a = curClip; return v < 0 ? -a : a;
+    }
+    void effFields(float al) {
+        effFields0(al);
+        if (pinOn) for (int i = 0; i < S; i++) reff[i] += pinv[i];
+        if (curClip > 0 || curPow != 1.f) { for (int i = 0; i < S; i++) reff[i] = xf(reff[i]); for (int m = 0; m < M; m++) Jeff[m] = xf(Jeff[m]); }
+    }
+    void effFields0(float al) {
+        if (!jointOK) { for (int i = 0; i < S; i++) reff[i] = fr[i] * r0[i]; for (int m = 0; m < M; m++) Jeff[m] = fJ[m] * J0[m]; return; }
+        for (int s = 0; s < K / 2; s++) {
+            int a = 2 * s, b = a + 1; float ma = tanhf(al * tot[a]), mb = tanhf(al * tot[b]);
+            reff[a] = fr[a] * pairField(ha[s], &pe[8 * s], mb); reff[b] = fr[b] * pairField(hb, &pe[8 * s + 4], ma);
+        }
+        for (int s = K / 2; s < N / 2; s++) {
+            int m1 = 2 * s - K, m2 = m1 + 1;
+            Jeff[m1] = fJ[m1] * pairField(ha[s], &pe[8 * s], pall[m2]); Jeff[m2] = fJ[m2] * pairField(hb, &pe[8 * s + 4], pall[m1]);
+        }
+    }
+
+    // one attempt: nsteps asynchronous sweeps from the uninformed state; leaves decision values in D
+    void resetState() {
+        for (int e = 0; e < E; e++) phi[e] = 0;
+        for (int i = 0; i < S; i++) tot[i] = 0;
+        for (int m = 0; m < M; m++) pall[m] = 0;
+    }
+    void readout(const Params &P) {
+        const float al = P.alpha[P.steps], ro = P.rho[P.steps];
+        effFields(al);
+        for (int i = 0; i < S; i++) { float v = ro * reff[i] + al * tot[i]; D[i] = v != 0 ? v : r0[i]; }
+    }
+    int attempt(int nsteps, const Params &P, int abT = 0, float abThr = 0) { resetState(); return runSteps(0, nsteps, P, nsteps == P.steps, abT, abThr); }
+    // nsteps asynchronous sweeps starting at step index t0 from the current state; leaves decision values in D
+    int runSteps(int t0, int nsteps, const Params &P, bool direct = true, int abT = 0, float abThr = 0) {
+        for (int tt = 0; tt < nsteps; tt++) {
+            int t = tt; int ti = direct ? std::min(t0 + tt, P.steps - 1) : (int)((long)tt * P.steps / nsteps);
+            const float al = P.alpha[ti], ro = P.rho[ti], kp = P.kap[ti];
+            effFields(al);
+            for (int m = 0; m < M; m++) tm[m] = tanhf(kp * Jeff[m]);
+            bool kickNow = kickOn && P.kickG != 0 && t >= P.kickT && (t == P.kickT || (P.kickEvery > 0 && (t - P.kickT) % P.kickEvery == 0));
+            bool preKick = kickOn && P.kickG != 0 && t + 1 >= P.kickT && (t + 1 == P.kickT || (P.kickEvery > 0 && (t + 1 - P.kickT) % P.kickEvery == 0));
+            if (!kickNow) for (int k = M - 1; k > 0; k--) { int j = (int)(rnd() % (unsigned)(k + 1)); std::swap(order[k], order[j]); }
+            if (kickNow || preKick) phiPrev = phi;
+            for (int q = 0; q < M; q++) {
+                int m = order[q], a = rs[m], d = rs[m + 1] - a; float pre[64], x[64], acc = 1.f;
+                for (int k = 0; k < d; k++) { int i = cols[a + k]; x[k] = tanhf(ro * reff[i] + al * (tot[i] - phi[a + k])); pre[k] = acc; acc *= x[k]; }
+                pall[m] = acc; acc = tm[m];
+                for (int k = d - 1; k >= 0; k--) { float u = pre[k] * acc; acc *= x[k]; float nf = fatanh(u); tot[cols[a + k]] += nf - phi[a + k]; phi[a + k] = nf; }
+            }
+            if (abT > 0 && t + 1 == abT) {
+                float pc = 0; for (int i = 0; i < S; i++) pc += fabsf(ro * reff[i] + al * tot[i]);
+                if (pc / S < abThr) { for (int i = 0; i < S; i++) D[i] = 0; return t + 1; }
+            }
+            if (kickNow) {                 // jump along the slowly converging (soft) mode
+                for (int i = 0; i < S; i++) tot[i] = 0;
+                for (int e = 0; e < E; e++) { float v = phi[e] + P.kickG * (phi[e] - phiPrev[e]); if (v > 7.25f) v = 7.25f; else if (v < -7.25f) v = -7.25f; phi[e] = v; tot[cols[e]] += v; }
+            }
+        }
+        readout(P);
+        return nsteps;
+    }
+
+    // exact Ising energy of the codeword defined by the signs of D (unperturbed channel)
+    float energy(const std::vector<float> &Dv) {
+        for (int i = 0; i < S; i++) cand[i] = Dv[i] < 0;
+        if (sys) for (int m = 0; m < M; m++) { int s = 0; for (int k = rs[m]; k < rs[m + 1]; k++) s ^= cand[cols[k]]; cand[K + m] = (char)s; }
+        float e = 0;
+        if (jointOK) { for (int s = 0; s < N / 2; s++) { float sa = cand[2 * s] ? -1.f : 1.f, sb = cand[2 * s + 1] ? -1.f : 1.f; e -= ha[s] * sa + hb * sb + hd[s] * sa * sb; } }
+        else if (sys) { for (int i = 0; i < K; i++) e -= cand[i] ? -r0[i] : r0[i]; for (int m = 0; m < M; m++) e -= cand[K + m] ? -J0[m] : J0[m]; }
+        return e;
+    }
+
+    float polar(const std::vector<float> &v) const { float p = 0; for (int i = 0; i < S; i++) p += fabsf(v[i]); return p / S; }
+    void finish(char *bits) {
+        for (int i = 0; i < S; i++) bits[i] = D[i] < 0 ? 1 : 0;
+        if (sys) for (int m = 0; m < M; m++) { int s = 0; for (int k = rs[m]; k < rs[m + 1]; k++) s ^= bits[cols[k]]; bits[K + m] = (char)s; }
+    }
+    // Trajectories share gTA free steps, then each continues with its own hypothesis on the least polarised spins.
+    void decodeGuess(const Params &P, char *bits) {
+        for (int i = 0; i < S; i++) fr[i] = 1.f;
+        for (int m = 0; m < M; m++) fJ[m] = 1.f;
+        resetState(); runSteps(0, P.gTA, P); DA = D; sPhi = phi; sTot = tot; sPall = pall;
+        runSteps(P.gTA, P.steps - P.gTA, P);                       // trajectory 0: no hypothesis
+        if (polar(D) >= P.stuck) { finish(bits); return; }
+        statStuck++; bestD = D; float bestE = energy(D);
+        int s = P.guess, perTraj = (P.steps - P.gTA) / P.gLen, npat = std::min(1 << s, (P.maxtraj - 1) * perTraj);
+        if (P.gMaxPat > 0) npat = std::min(1 << s, P.gMaxPat);
+        std::vector<int> od(S); for (int i = 0; i < S; i++) od[i] = i;
+        std::partial_sort(od.begin(), od.begin() + s, od.end(), [&](int a, int b) { return fabsf(DA[a]) < fabsf(DA[b]); });
+        pinOn = true;
+        for (int q = 0; q < npat; q++) {
+            phi = sPhi; tot = sTot; pall = sPall;
+            for (int k = 0; k < s; k++) { int i = od[k]; pinv[i] = ((DA[i] < 0) != ((q >> k) & 1) ? -1.f : 1.f) * P.pinF; }
+            runSteps(P.gTA, P.gLen, P); statPinRuns++;
+            if (polar(D) < P.stuck) continue;
+            float e = energy(D); if (e < bestE) { bestE = e; bestD = D; statSwitch++; }
+        }
+        for (int k = 0; k < s; k++) pinv[od[k]] = 0;
+        pinOn = false; D = bestD; finish(bits);
+    }
+
+    // Extended search on one codeword: n more perturbed attempts of len steps each. An attempt replaces the incumbent when it
+    // ends polarised with a lower exact energy. Returns true if the incumbent (bits, bestE) was improved.
+    bool moreAttempts(const float *L, const Params &P, int n, int len, float sig, float &bestE, char *bits) {
+        prepFrame(L, P); bool improved = false;
+        for (int a = 0; a < n; a++) {
+            for (int i = 0; i < S; i++) fr[i] = 1.f + sig * gauss();
+            for (int m = 0; m < M; m++) fJ[m] = 1.f + sig * gauss();
+            attempt(len, P);
+            if (P.cont > 0) { for (int i = 0; i < S; i++) fr[i] = 1.f; for (int m = 0; m < M; m++) fJ[m] = 1.f; runSteps(len, P.cont, P); }
+            if (polar(D) < P.stuck) continue;
+            float e = energy(D);
+            if (e < bestE) { bestE = e; finish(bits); improved = true; }
+        }
+        return improved;
+    }
+
+    // Extended search with the fast engine: nb batches of 8 perturbed trajectories of len steps. The received value of every symbol
+    // is perturbed (y -> y (1 + sig g) + add sqrt(s2) g'). In the last pinLanes lanes, pinS spins drawn from F.pool (the least polarised
+    // spins of the unperturbed trajectory) additionally receive a strong random field. A trajectory replaces the incumbent when it ends
+    // polarised with a lower exact energy. Returns true if the incumbent (bits, F.bestE) was improved. rho rescales the received values
+    // (mismatched temperature), phiMax caps the interaction fields.
+    bool moreAttemptsFast(const float *L, const Params &P, int nb, int len, float sig, float add, Search &F, char *bits, int pinS = 0, float pinF = 4.f, int pinLanes = 0, float rho = 1.f, float phiMax = 4.f, int gmode = 0, int alt = 0, int local = 0) {
+        PROF_T(0);
+        if (F.cached) { ysym = F.cy; ha = F.cha; hd = F.chd; jointOK = true; }          // same values as prepFrame, without redoing the inversion of the demapper
+        else { prepFrame(L, P); if (fastOK && jointOK) { F.cy = ysym; F.cha = ha; F.chd = hd; F.cached = true; } }
+        PROF_T(1);
+        if (!(fastOK && jointOK)) { F.natt += nb * 8; return moreAttempts(L, P, nb * 8, len, sig, F.bestE, bits); }
+        bool improved = false; const double s2 = 0.5 * pow(10.0, -snr / 10.0), sd = sqrt(s2);
+        v8 *pT = vp(fT), *pR = vp(fR), *pG = vp(fG), *pPm = vp(fPm);
+        Fast8Ctx c; c.M = M; c.K = K; c.N = N; c.len = len; c.rng = &rng;
+        if (alt && nAux > 0) { c.rs = rs2.data(); c.cols = cols2.data(); c.order = order2.data(); c.M2 = M2; c.S2 = S2; }
+        else { c.rs = rs.data(); c.cols = cols.data(); c.order = order.data(); c.M2 = M; c.S2 = S; }
+        c.T = pT; c.Q = vp(fQ); c.IQ = vp(fIQ); c.R = pR; c.tm = vp(fTm); c.pall = vp(fPall); c.G = pG; c.Pm = pPm;
+        c.k = (float)exp(-2.0 * std::min(qc, 20.0)); c.U = tanhf(std::min(phiMax, 30.f / (float)maxDeg)); c.gmode = gmode;
+        // pinS < 0: the pinned spins are drawn among those where the incumbent contradicts the unperturbed trajectory (strongest fields first)
+        // and are pinned to the sign of that trajectory, which pushes the dynamics out of the basin of the incumbent.
+        const bool anti = pinS < 0; if (anti) { pinS = -pinS; antiPool.clear();
+            if ((int)F.d0.size() == S) { for (int i = 0; i < S; i++) if ((bits[i] ? -1.f : 1.f) * F.d0[i] < 0) antiPool.push_back(i);
+                std::sort(antiPool.begin(), antiPool.end(), [&](int a, int b) { return fabsf(F.d0[a]) > fabsf(F.d0[b]); }); if (antiPool.size() > 32) antiPool.resize(32); } }
+        const std::vector<int> &pl = anti ? antiPool : F.pool;
+        const int pool = (int)pl.size(); const bool pin = pinS > 0 && pinLanes > 0 && pool >= pinS; const float up = expf(2.f * pinF), dn = 1.f / up;
+        for (int b = 0; b < nb; b++) {
+            PROF_T(0);
+            // local mode: the perturbation of each lane is correlated (coefficient cl) with the one that produced the incumbent, so the search
+            // moves in the space of perturbations around the best one found so far instead of drawing independent ones
+            const bool loc = local && (int)F.ubest.size() == N / 2; static const float cl[8] = {0.97f, 0.93f, 0.87f, 0.8f, 0.7f, 0.6f, 0.45f, 0.3f};
+            if ((int)ucur.size() != 4 * N) ucur.resize(4 * N);
+            for (int s = 0; s < N / 2; s++) for (int l = 0; l < 8; l++) {
+                float u = sig * gauss(); if (loc) u = cl[l] * F.ubest[s] + sqrtf(1.f - cl[l] * cl[l]) * u; ucur[8 * s + l] = u;
+                double y = ysym[s] * (rho + u); if (add != 0) y += add * sd * gauss();
+                pG[s][l] = expf((float)std::max(-18.0, std::min(18.0, 2 * qa * y)));
+            }
+            if (pin) for (int l = 8 - pinLanes; l < 8; l++) for (int k = 0; k < pinS; k++) { uint64_t r = rnd(); int i = pl[(r >> 8) % (unsigned)pool]; pPm[i][l] = anti ? (F.d0[i] > 0 ? up : dn) : ((r & 1) ? up : dn); }
+            PROF_T(2); fast8_run(c); statFast += 8; F.natt += 8; PROF_T(3);
+            if (pin) for (int k = 0; k < pool; k++) pPm[pl[k]] = V8(1.f);
+            float pol[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int i = 0; i < S; i++) { v8 o = pR[i] * pT[i]; for (int l = 0; l < 8; l++) {
+                union { float f; uint32_t u; } w; w.f = o[l]; float lg = (float)((int)((w.u >> 23) & 255) - 127) + (float)(w.u & 0x7fffff) * (1.f / 8388608.f);
+                pol[l] += fabsf(lg); } }
+            if (collectStuck) {                 // ensemble of the trajectories that stayed weakly polarised: hard votes and summed (clipped) fields
+                if (F.svH.empty()) { F.svH.assign(S, 0); F.svS.assign(S, 0.f); }
+                bool st[8]; int ns = 0; for (int l = 0; l < 8; l++) { st[l] = pol[l] * 0.34657f / S < P.stuck; ns += st[l]; }
+                if (ns) { F.nsv += ns; for (int i = 0; i < S; i++) { v8 o = pR[i] * pT[i]; for (int l = 0; l < 8; l++) if (st[l]) {
+                    union { float f; uint32_t u; } w; w.f = o[l]; float lg = ((float)((int)((w.u >> 23) & 255) - 127) + (float)(w.u & 0x7fffff) * (1.f / 8388608.f)) * 0.34657f;
+                    F.svH[i] += lg >= 0 ? 1 : -1; F.svS[i] += lg > 3.f ? 3.f : (lg < -3.f ? -3.f : lg); } } }
+            }
+            for (int l = 0; l < 8; l++) {
+                if (pol[l] * 0.34657f / S < P.stuck) continue;
+                for (int i = 0; i < S; i++) D[i] = pR[i][l] * pT[i][l] >= 1.f ? 1.f : -1.f;
+                float e = energy(D); F.npol++;
+                if (F.vote.empty()) { F.vote.assign(S, 0); F.voteLow.assign(S, 0); }
+                for (int i = 0; i < S; i++) F.vote[i] += D[i] > 0 ? 1 : -1;
+                if (e < F.bestE + voteGap) { F.nLow++; for (int i = 0; i < S; i++) F.voteLow[i] += D[i] > 0 ? 1 : -1; }
+                if (e < F.bestE) { F.bestE = e; F.hits = 1; F.foundAt = F.natt; finish(bits); improved = true; F.ubest.resize(N / 2); for (int q = 0; q < N / 2; q++) F.ubest[q] = ucur[8 * q + l]; if (loc) statLocImp++; else statNormImp++; }
+                else if (e == F.bestE) F.hits++;
+            }
+            PROF_T(4);
+        }
+        return improved;
+    }
+
+    // decode one codeword; bits[0..N) receives the codeword
+    void decode(const float *L, const Params &P, char *bits) {
+        prepFrame(L, P); lastStuck = false;
+        if (sys && P.guess > 0) { decodeGuess(P, bits); return; }
+        for (int i = 0; i < S; i++) fr[i] = 1.f;
+        for (int m = 0; m < M; m++) fJ[m] = 1.f;
+        if (P.ravg > 1) { resetState(); runSteps(0, P.steps - P.ravg, P); std::vector<float> acc(S, 0.f); for (int k = 0; k < P.ravg; k++) { runSteps(P.steps - P.ravg + k, 1, P); for (int i = 0; i < S; i++) acc[i] += D[i]; } D = acc; }
+        else attempt(P.steps, P);
+        D0 = D;
+        if (sys && P.avg && P.ntraj > 1) {
+            bestD = D;
+            for (int tr = 1; tr < P.ntraj && tr < 6; tr++) {
+                for (int i = 0; i < S; i++) fr[i] = 1.f + P.sig * gauss();
+                for (int m = 0; m < M; m++) fJ[m] = 1.f + P.sig * gauss();
+                attempt(P.steps, P); for (int i = 0; i < S; i++) bestD[i] += D[i];
+            }
+            D = bestD;
+        }
+        float pol = 0; for (int i = 0; i < S; i++) pol += fabsf(D[i]); pol /= S;
+        lastStuck = sys && pol < P.stuck;
+        if (sys && !P.avg && P.ntraj > 1 && pol < P.stuck) {
+            statStuck++; bestD = D; float bestE = energy(D);
+            int natt = std::max(1, P.natt), len = P.steps / natt;
+            for (int tr = 1; tr < P.ntraj && tr < P.maxtraj; tr++) { int budget = P.steps; for (int a = 0; budget >= len; a++) {
+                if (P.fb && a > 0) {            // re-initialise from what the previous attempt of this trajectory learned
+                    const float al = P.alpha[P.steps], ro = P.rho[P.steps];
+                    for (int i = 0; i < S; i++) {
+                        float ext = al * tot[i], ch = ro * reff[i];
+                        if (P.fb == 1) fr[i] = (ch * ext < 0 && fabsf(ext) > P.fbthr * fabsf(ch)) ? 0.f : 1.f;
+                        else fr[i] = 1.f + P.fbg * tanhf(ch * ext);
+                    }
+                    for (int m = 0; m < M; m++) {
+                        float ext = fatanh(pall[m]), ch = Jeff[m];
+                        if (P.fb == 1) fJ[m] = (ch * ext < 0 && fabsf(ext) > P.fbthr * fabsf(ch)) ? 0.f : 1.f;
+                        else fJ[m] = 1.f + P.fbg * tanhf(ch * ext);
+                    }
+                } else {
+                    kickOn = true; float f5 = (float)(tr - 1) / 4.f; curClip = P.clipA + (P.clipB - P.clipA) * f5; curPow = P.powA + (P.powB - P.powA) * f5;
+                    float g0 = 1.f + P.gsc * (float)(tr - 3);
+                    for (int i = 0; i < S; i++) fr[i] = g0 * (1.f + P.sig * gauss());
+                    for (int m = 0; m < M; m++) fJ[m] = g0 * (1.f + P.sig * gauss());
+                }
+                int used = attempt(len, P, P.abT, P.abThr); budget -= used; if (used < len) continue;
+                if (P.cont > 0) { for (int i = 0; i < S; i++) fr[i] = 1.f; for (int m = 0; m < M; m++) fJ[m] = 1.f; runSteps(len, P.cont, P); }
+                if (P.accpol) { float pc = 0; for (int i = 0; i < S; i++) pc += fabsf(D[i]); if (pc / S < P.stuck) continue; }
+                float e = energy(D);
+                if (e < bestE - P.margin) { bestE = e; bestD = D; statSwitch++; }
+            } }
+            D = bestD; curClip = 0; curPow = 1; kickOn = false;
+            lastStuck = polar(D) < P.stuck;
+            if (P.pins > 0) {              // guess the least polarised spins of the stuck state
+                std::vector<int> od(S); for (int i = 0; i < S; i++) od[i] = i;
+                std::vector<float> D0 = bestD;                                  // stuck state of trajectory 0 or best so far
+                float pc0 = 0; for (int i = 0; i < S; i++) pc0 += fabsf(D0[i]);
+                if (pc0 / S < P.stuck) {
+                    std::partial_sort(od.begin(), od.begin() + P.pins, od.end(), [&](int a, int b) { return fabsf(D0[a]) < fabsf(D0[b]); });
+                    for (int i = 0; i < S; i++) fr[i] = 1.f;
+                    for (int m = 0; m < M; m++) fJ[m] = 1.f;
+                    pinOn = true; int npat = P.pinOracle ? 1 : (1 << P.pins);
+                    for (int q = 0; q < npat; q++) {
+                        for (int k = 0; k < P.pins; k++) { int i = od[k]; float sgn = P.pinOracle ? (truth[i] ? -1.f : 1.f) : ((D0[i] < 0) != ((q >> k) & 1) ? -1.f : 1.f); pinv[i] = sgn * P.pinF; }
+                        attempt(P.pinLen, P); statPinRuns++;
+                        float pc = 0; for (int i = 0; i < S; i++) pc += fabsf(D[i]); if (pc / S < P.stuck) continue;
+                        float e = energy(D); if (e < bestE) { bestE = e; bestD = D; statSwitch++; }
+                    }
+                    for (int k = 0; k < P.pins; k++) pinv[od[k]] = 0;
+                    pinOn = false; D = bestD;
+                }
+            }
+        }
+        if (sys) lastE = energy(D);
+        finish(bits);
+    }
+};
+using namespace std;
+
+#ifndef EXT_SECONDS
+#define EXT_SECONDS 117     // total run-time budget (s) of the extended search on suspect codewords; 0 = 6 trajectories only
+#endif
+#ifndef ZT
+#define ZT 2.5f
+#endif
+#ifndef FAST
+#define FAST 1
+#endif
+#ifndef FBATCH
+#define FBATCH 4
+#endif
+#ifndef FLEN
+#define FLEN 0
+#endif
+#ifndef FSIG
+#define FSIG 0.25f
+#endif
+#ifndef FADD
+#define FADD 0.f
+#endif
+#ifndef NKIND
+#define NKIND 9
+#endif
+#ifndef BFLOOR
+#define BFLOOR 0.05
+#endif
+#ifndef BDECAY
+#define BDECAY 0.97
+#endif
+#ifndef MAINSHARE
+#define MAINSHARE 0.0
+#endif
+#ifndef POLISH
+#define POLISH 0
+#endif
+#ifndef POLALL
+#define POLALL 0
+#endif
+#ifndef POLTIME
+#define POLTIME 0.3
+#endif
+#ifndef POLLEN
+#define POLLEN 0
+#endif
+#ifndef POLADD
+#define POLADD 0.f
+#endif
+#ifndef PSTUCK
+#define PSTUCK 6.f
+#endif
+#ifndef POLSIG
+#define POLSIG 0.6f
+#endif
+#ifndef ONLYKIND
+#define ONLYKIND -1
+#endif
+#ifndef KSM
+#define KSM 1.f
+#endif
+#ifndef KADD
+#define KADD 0.f
+#endif
+#ifndef KLM
+#define KLM 1
+#endif
+#ifndef KPINS
+#define KPINS 0
+#endif
+#ifndef KRHO
+#define KRHO 1.f
+#endif
+#ifndef KGM
+#define KGM 0
+#endif
+#ifndef KALT
+#define KALT 0
+#endif
+#ifndef KPHI
+#define KPHI 4.f
+#endif
+#ifndef MAINSHARE_LONG
+#define MAINSHARE_LONG 0.5
+#endif
+#ifndef PFMAXN
+#define PFMAXN 1000
+#endif
+#ifndef FASTONLY
+#define FASTONLY 1
+#endif
+#ifndef COLLECT
+#define COLLECT 0
+#endif
+#ifndef FALLBACK
+#define FALLBACK 1
+#endif
+#ifndef ZFB
+#define ZFB 3.5
+#endif
+#ifndef LOCALEVERY
+#define LOCALEVERY 0
+#endif
+#ifndef SIGCONST
+#define SIGCONST 0
+#endif
+#ifndef ALTSHIFT
+#define ALTSHIFT 2
+#endif
+#ifndef ALTREP
+#define ALTREP 1
+#endif
+#ifndef PORTFOLIO
+#define PORTFOLIO 0
+#endif
+#ifndef ADDSC
+#define ADDSC 1.f
+#endif
+#ifndef PINS
+#define PINS 0
+#endif
+#ifndef PINF
+#define PINF 4.f
+#endif
+#ifndef PINLANES
+#define PINLANES 4
+#endif
+#ifndef PINPOOL
+#define PINPOOL 24
+#endif
+#ifndef HSCHED
+#define HSCHED 1
+#endif
+#ifndef HRARE
+#define HRARE 32
+#endif
+#ifndef HLOW
+#define HLOW 2
+#endif
+#ifndef HHIGH
+#define HHIGH 8
+#endif
+#ifndef EXT_ALL
+#define EXT_ALL 0
+#endif
+#ifndef ZEVERY
+#define ZEVERY 4
+#endif
+
+static char *buf; static size_t blen, bpos;
+static inline void skipws() { while (bpos < blen && (unsigned char)buf[bpos] <= ' ') bpos++; }
+static inline long readInt() {
+    skipws(); bool neg = false; if (buf[bpos] == '-') { neg = true; bpos++; }
+    long v = 0; while (bpos < blen && buf[bpos] >= '0' && buf[bpos] <= '9') v = v * 10 + (buf[bpos++] - '0');
+    return neg ? -v : v;
+}
+static inline double readDouble() { skipws(); char *e; double v = strtod(buf + bpos, &e); bpos = e - buf; return v; }
+
+static const auto T0 = chrono::steady_clock::now();
+static inline double elapsed() {            // the larger of wall-clock and CPU time since the start of the program
+    double w = chrono::duration<double>(chrono::steady_clock::now() - T0).count(), c = (double)clock() / CLOCKS_PER_SEC;
+    return w > c ? w : c;
+}
+
+int main() {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_setcsr(_mm_getcsr() | 0x8040);      // flush denormals to zero: they only slow the arithmetic down
+#endif
+    {
+        size_t cap = 1 << 26; buf = (char *)malloc(cap + 1); blen = 0;
+        for (;;) { size_t r = fread(buf + blen, 1, cap - blen, stdin); blen += r; if (blen < cap) break; cap *= 2; buf = (char *)realloc(buf, cap + 1); }
+        buf[blen] = 0; bpos = 0;
+    }
+    int N = (int)readInt(), K = (int)readInt(), B = (int)readInt(); double snr = readDouble();
+    int M = N - K;
+    vector<vector<int>> rows(M);
+    for (int m = 0; m < M; m++) for (int j = 0; j < N; j++) { skipws(); if (buf[bpos++] == '1') rows[m].push_back(j); }
+    vector<float> L((size_t)B * N);
+    for (size_t i = 0; i < (size_t)B * N; i++) L[i] = (float)readDouble();
+    // the generator matrix that follows is not needed: the model is built from H = [P | I]
+
+    Decoder dec; dec.setCode(N, K, snr, rows);
+    dec.collectStuck = COLLECT;
+    Params P;                                   // trained / tuned settings, stored per code rate and length
+    // dense = at least 3.5 interactions per information spin on average: the dynamics is then bistable (a codeword either polarises or stays
+    // in a weakly polarised state) and the lowest-energy polarised state is the right read-out. Sparser codes keep the single trajectory.
+    bool dense = dec.sys && 2 * (long)dec.E >= 7 * (long)K;
+    if (dense) {                                // perturbed trajectories on weakly polarised codewords
+        P.ntraj = dec.fastOK && FASTONLY ? 1 : 6; P.sig = 0.15f; P.natt = N <= 1296 ? 2 : 1;
+    }
+    P.stuck = PSTUCK;
+    vector<char> bits((size_t)B * N); vector<int> open; vector<Search> rec; vector<float> E1(B, 0.f); vector<char> isOpen(B, 0);
+    const float ZTHR = ZT;                      // a codeword whose normalised squared distance to the received values exceeds this is suspect
+    for (int b = 0; b < B; b++) {
+        dec.decode(&L[(size_t)b * N], P, &bits[(size_t)b * N]); E1[b] = dec.lastE;
+        if ((dense || EXT_ALL) && dec.sys && (dec.lastStuck || dec.zOf(dec.lastE) > ZTHR)) {
+            open.push_back(b); isOpen[b] = 1; Search F; F.bestE = dec.lastE; F.zc = dec.zc; F.hits = dec.lastStuck ? 0 : 1;
+            if ((PINS > 0 || PORTFOLIO) && (int)dec.D0.size() == K) {          // pool of the least polarised spins of the unperturbed trajectory
+                vector<int> od(K); for (int i = 0; i < K; i++) od[i] = i; int np = min(K, PINPOOL);
+                partial_sort(od.begin(), od.begin() + np, od.end(), [&](int a, int c) { return fabsf(dec.D0[a]) < fabsf(dec.D0[c]); }); F.pool.assign(od.begin(), od.begin() + np);
+            }
+            F.d0 = dec.D0;
+            rec.push_back(F);
+        }
+    }
+#ifdef STATS
+    fprintf(stderr, "pass 1 done at %.1fs, suspects %d of %d, pair variables %d%c", elapsed(), (int)open.size(), B, dec.nAux, 10);
+#endif
+    // Extended search: the suspect codewords receive further perturbed attempts, in turn, until the time budget is spent.
+    // Codewords whose incumbent is still implausible are visited every round, the others every ZEVERY-th round.
+    long nAtt = 0; int nOpen0 = (int)open.size();
+    {   // random stream of the search phase, one per code length (the first pass does not depend on it)
+        int seed = SEED_OF_N;
+        dec.rng += (uint64_t)seed * 0xD1B54A32D192ED03ULL;
+    }
+    if (EXT_SECONDS > 0) {
+        // Longer codes need longer trajectories and a weaker perturbation (its useful strength scales like 1/sqrt(N)).
+        const int len = FLEN ? FLEN : (N < 1000 ? 25 : N < 2500 ? 50 : 100); const float nscale = sqrtf(648.f / (float)N), fsig = FSIG * nscale; (void)nscale;
+#if !FAST
+        const int chunk = N <= 1296 ? 16 : 8; const float sigs[4] = {0.15f, 0.25f, 0.2f, 0.3f};
+#endif
+        const double deadline = EXT_SECONDS;
+#if FAST && POLISH
+        // Polish: the codewords that polarised at once also receive a few perturbed trajectories; the lowest-energy polarised state is kept
+        // (the unperturbed trajectory sometimes settles a few spins away from a better codeword).
+        if ((dense || POLALL) && dec.fastOK) for (int b = 0; b < B && elapsed() < POLTIME * deadline; b++) if (!isOpen[b]) {
+            Search F; F.bestE = E1[b]; dec.moreAttemptsFast(&L[(size_t)b * N], P, POLISH, POLLEN ? POLLEN : min(len, 50), fsig * POLSIG, POLADD, F, &bits[(size_t)b * N]); nAtt += 8 * POLISH;
+        }
+#endif
+#if FAST && PORTFOLIO
+        // Portfolio of perturbation kinds: {strength of the multiplicative perturbation, additive perturbation (in noise standard deviations),
+        // trajectory length factor, number of pinned least-polarised spins, rescaling of the received values, cap of the interaction fields}. Each kind saturates on its own and different kinds release
+        // different codewords, so every round (one visit of the active codewords) draws its kind with a probability that follows the
+        // recent rate of improvements per second of each kind (exponentially forgotten), with a floor so that every kind keeps being tried.
+        static const struct { float sm, add; int lm, pins; float rho, phiMax; int gm, alt; } kinds[] = {{1.f, 0.f, 1, 0, 1.f, 4.f}, {0.6f, 0.3f, 1, 0, 1.f, 4.f}, {1.6f, 0.f, 1, 0, 1.f, 4.f}, {0.6f, 0.3f, 2, 0, 1.f, 4.f}, {0.6f, 0.2f, 1, 2, 1.f, 4.f}, {0.f, 0.3f, 1, 0, 1.f, 4.f},
+            {1.f, 0.f, 1, 0, 1.15f, 4.f}, {1.f, 0.f, 1, 0, 1.f, 2.f}, {1.f, 0.f, 1, -3, 1.f, 4.f}, {KSM, KADD, KLM, KPINS, KRHO, KPHI, KGM, KALT}};     // pins < 0: pins against the incumbent; the last entry is a research slot
+        double rw[NKIND], tw[NKIND]; long used[NKIND]; for (int k = 0; k < NKIND; k++) { rw[k] = 0; tw[k] = 0; used[k] = 0; }
+        uint64_t brng = 0x243F6A8885A308D3ULL; int mainCnt = 0;
+        // Short codes saturate the main kind within the budget: all kinds, equal footing. Longer codes: the main kind keeps half of the rounds
+        // and shares the rest with the three alternatives that released codewords there (rescaled values, capped fields, pins against the incumbent).
+        int act[NKIND], nk = 0; const bool shortCode = N < PFMAXN; const double mainShare = shortCode ? MAINSHARE : MAINSHARE_LONG;
+        for (int k = 0; k < NKIND && k < 9; k++) if (shortCode || k == 0 || k >= 6) act[nk++] = k;
+        if (NKIND > 9) act[nk++] = 9;
+        for (int round = 0; !open.empty() && elapsed() < deadline; round++) {
+            double rate[NKIND], sum = 0; for (int a = 0; a < nk; a++) { rate[a] = (rw[act[a]] + 0.3) / (tw[act[a]] + 0.3); sum += rate[a]; }
+            brng ^= brng << 13; brng ^= brng >> 7; brng ^= brng << 17; double u = (double)(brng >> 11) / 9007199254740992.0, acc = 0; int kd = act[nk - 1];
+            for (int a = 0; a < nk; a++) { acc += BFLOOR + (1.0 - nk * BFLOOR) * rate[a] / sum; if (u < acc) { kd = act[a]; break; } }
+            if (round < nk) kd = act[round];                  // start by trying every kind once
+            else if (mainShare > 0) { brng ^= brng << 13; brng ^= brng >> 7; brng ^= brng << 17; if ((double)(brng >> 11) / 9007199254740992.0 < mainShare) kd = 0; }
+            if (ONLYKIND >= 0) kd = ONLYKIND;
+            float sig = fsig * kinds[kd].sm; if (kd == 0) sig *= 0.6f + 0.2f * (float)(mainCnt++ & 3);
+            double t0 = elapsed(), reward = 0;
+            for (size_t q = 0; q < open.size() && elapsed() < deadline; q++) {
+                float z = (float)((2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N));
+#if HSCHED
+                // An incumbent reached again and again by independent trajectories is almost surely final: such codewords are visited rarely,
+                // so that the time goes to the codewords that are still implausible or whose incumbent was reached only once or twice.
+                { int period = (z > ZTHR || rec[q].hits <= HLOW) ? 1 : (rec[q].hits < HHIGH ? 4 : HRARE); if (round % period != 0) continue; }
+#else
+                if (z <= ZTHR && round % ZEVERY != 0) continue;
+#endif
+                int b = open[q], nb = kinds[kd].lm > 1 ? FBATCH / 2 : FBATCH;
+                if (dec.moreAttemptsFast(&L[(size_t)b * N], P, nb, len * kinds[kd].lm, sig, kinds[kd].add * nscale, rec[q], &bits[(size_t)b * N], kinds[kd].pins, PINF, 8, kinds[kd].rho, kinds[kd].phiMax, kinds[kd].gm, kinds[kd].alt))
+                    reward += (2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N) <= ZTHR ? 1.0 : 0.2;
+                nAtt += 8 * nb;
+            }
+            double dt = elapsed() - t0; used[kd]++;
+            for (int k = 0; k < NKIND; k++) { rw[k] *= BDECAY; tw[k] *= BDECAY; }
+            rw[kd] += reward; tw[kd] += dt;
+        }
+#ifdef STATS
+        fprintf(stderr, "rounds per kind:"); for (int k = 0; k < NKIND; k++) fprintf(stderr, " %ld", used[k]); fprintf(stderr, "%c", 10);
+#endif
+#else
+        for (int round = 0; !open.empty() && elapsed() < deadline; round++)
+            for (size_t q = 0; q < open.size() && elapsed() < deadline; q++) {
+                float z = (float)((2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N));
+#if HSCHED
+                // An incumbent reached again and again by independent trajectories is almost surely final: such codewords are visited rarely,
+                // so that the time goes to the codewords that are still implausible or whose incumbent was reached only once or twice.
+                { int period = (z > ZTHR || rec[q].hits <= HLOW) ? 1 : (rec[q].hits < HHIGH ? 4 : HRARE); if (round % period != 0) continue; }
+#else
+                if (z <= ZTHR && round % ZEVERY != 0) continue;
+#endif
+                int b = open[q];
+#if FAST
+                // the two exact representations of the cost function (with and without pair variables) alternate: each releases codewords the other misses
+                dec.moreAttemptsFast(&L[(size_t)b * N], P, FBATCH, len, fsig * (SIGCONST ? 1.f : 0.6f + 0.2f * (round & 3)), FADD, rec[q], &bits[(size_t)b * N], PINS, PINF, PINLANES, 1.f, 4.f, 0, ALTREP ? (round >> ALTSHIFT) & 1 : 0, LOCALEVERY > 0 && round % LOCALEVERY == LOCALEVERY - 1); nAtt += 8 * FBATCH;
+#else
+                dec.moreAttempts(&L[(size_t)b * N], P, chunk, len, sigs[round & 3], rec[q].bestE, &bits[(size_t)b * N]); nAtt += chunk;
+#endif
+            }
+#endif
+    }
+#if FALLBACK
+    // Fallback: a codeword found by the search that is still clearly implausible (normalised squared distance above ZFB) and that was reached
+    // at most twice is on average further from the truth than the read-out of the unperturbed trajectory, which is restored.
+    int nFb = 0;
+    for (size_t q = 0; q < open.size(); q++) {
+        double z = (2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N);
+        if (z > ZFB && rec[q].hits >= 1 && rec[q].hits <= 2 && rec[q].npol > 0 && (int)rec[q].d0.size() == K) { dec.D = rec[q].d0; dec.finish(&bits[(size_t)open[q] * N]); nFb++; }
+    }
+#ifdef STATS
+    fprintf(stderr, "fallbacks: %d, improvements in local rounds %ld, in normal rounds %ld%c", nFb, dec.statLocImp, dec.statNormImp, 10);
+#endif
+    (void)nFb;
+#endif
+#ifdef STATS
+    if (getenv("ALTOUT")) {             // research: codewords whose incumbent is still implausible fall back to the read-out of the unperturbed trajectory
+        vector<char> vb = bits; FILE *fv = fopen(getenv("ALTOUT"), "w");
+        for (size_t q = 0; q < open.size(); q++) { double z = (2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N); int mode = getenv("ALTMODE") ? atoi(getenv("ALTMODE")) : 0;
+            if ((z <= ZTHR && mode != 3) || (int)rec[q].d0.size() != K) continue;
+            for (int i = 0; i < K; i++) { float v = rec[q].d0[i]; if (mode == 1 && !rec[q].svH.empty() && rec[q].svH[i] != 0) v = (float)rec[q].svH[i]; if (mode == 2 && !rec[q].svS.empty()) v = rec[q].svS[i] + rec[q].d0[i];
+                vb[(size_t)open[q] * N + i] = v < 0; } }
+        for (int b = 0; b < B; b++) for (int i = 0; i < N; i++) { fputc('0' + vb[(size_t)b * N + i], fv); fputc(i + 1 < N ? ' ' : 10, fv); }
+        fclose(fv);
+    }
+    if (getenv("VOTEOUT")) {            // research: decisions of the vote of all polarised trajectories (information part only, parity re-encoded is not needed for scoring)
+        vector<char> vb = bits; FILE *fv = fopen(getenv("VOTEOUT"), "w"); int mode = getenv("VOTEMODE") ? atoi(getenv("VOTEMODE")) : 0;
+        for (size_t q = 0; q < open.size(); q++) { const vector<int> &v = mode ? rec[q].voteLow : rec[q].vote; if (v.empty()) continue;
+            for (int i = 0; i < K; i++) if (v[i] != 0) vb[(size_t)open[q] * N + i] = v[i] < 0; }
+        for (int b = 0; b < B; b++) for (int i = 0; i < N; i++) { fputc('0' + vb[(size_t)b * N + i], fv); fputc(i + 1 < N ? ' ' : 10, fv); }
+        fclose(fv);
+    }
+#endif
+#ifdef PROF
+    fprintf(stderr, "prof: prep %.2f gen %.2f run %.2f post %.2f%c", profAcc[1], profAcc[2], profAcc[3], profAcc[4], 10);
+#endif
+#ifdef STATS
+    { int imp = 0; for (size_t q = 0; q < open.size(); q++) { double z = (2.0 * rec[q].bestE + rec[q].zc - 0.5 * N) / sqrt((double)N); imp += z > ZTHR;
+        if (getenv("FRAMES")) fprintf(stderr, "F %d z %.2f hits %d npol %ld natt %ld foundAt %ld%c", open[q], z, rec[q].hits, rec[q].npol, rec[q].natt, rec[q].foundAt, 10); }
+      fprintf(stderr, "N=%d K=%d suspect after 6 trajectories: %d, still implausible: %d, extra attempts: %ld, time %.1fs%c", N, K, nOpen0, imp, nAtt, elapsed(), 10); }
+#endif
+    (void)nAtt; (void)nOpen0;
+    string res; res.reserve((size_t)B * (2 * N));
+    for (int b = 0; b < B; b++) for (int i = 0; i < N; i++) { res.push_back((char)('0' + bits[(size_t)b * N + i])); res.push_back(i + 1 < N ? ' ' : '\n'); }
+    fwrite(res.data(), 1, res.size(), stdout);
+    return 0;
+}
