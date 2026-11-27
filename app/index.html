@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0d10" />
+    <title>Lab 3D · Le cœur</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="barre">
+        <button class="icone seulement-mobile" id="ouvrir-structures" type="button" aria-label="Afficher la liste des structures">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+        </button>
+        <div class="marque">
+          <span class="logo">Lab<b>3D</b></span>
+          <span class="organe">Le cœur</span>
+        </div>
+        <div class="lecon">
+          <span id="lecon-titre"></span>
+          <span id="lecon-competence"></span>
+        </div>
+        <div class="segment" id="niveaux" role="group" aria-label="Classe"></div>
+        <button class="bouton discret" id="partager" type="button">Copier le lien de cette vue</button>
+      </header>
+
+      <aside class="panneau" id="structures" aria-label="Structures du cœur">
+        <div class="panneau-tete">
+          <h2>Structures</h2>
+          <button class="bouton discret" id="tout-afficher" type="button">Tout afficher</button>
+        </div>
+        <div id="arbre"></div>
+      </aside>
+
+      <main id="scene">
+        <div class="outils" id="outils">
+          <div class="segment" id="modes" role="group" aria-label="Mode d'affichage"></div>
+          <button class="bouton bascule" id="b-etiquettes" type="button">Étiquettes</button>
+          <button class="bouton" id="b-recentrer" type="button">Recentrer</button>
+        </div>
+        <div class="reglage" id="reglage" hidden>
+          <label for="curseur" id="reglage-nom"></label>
+          <input type="range" id="curseur" />
+        </div>
+        <div class="chargement" id="chargement">Chargement du cœur…</div>
+        <div class="temps" id="temps">
+          <button class="icone" id="lecture" type="button" aria-label="Lecture ou pause">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path id="lecture-forme" d="" /></svg>
+          </button>
+          <div class="cycle">
+            <div class="cycle-phase" id="cycle-phase"></div>
+            <div class="cycle-barre" id="cycle-barre" role="slider" aria-label="Position dans le battement" tabindex="0">
+              <span class="tranche t1"></span><span class="tranche t2"></span><span class="tranche t3"></span>
+              <span class="curseur" id="cycle-curseur"></span>
+            </div>
+          </div>
+          <button class="bouton" id="vitesse" type="button" aria-label="Vitesse de lecture"></button>
+          <div class="rythme"><b id="bpm"></b><span>battements/min</span></div>
+        </div>
+      </main>
+
+      <aside class="panneau" id="fiche" aria-live="polite"></aside>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
